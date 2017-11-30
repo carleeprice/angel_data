@@ -1,0 +1,189 @@
+---
+title: "Current CB data"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+Load in the assembled data
+
+```{r}
+#cbset includes 
+library(dplyr)
+library(zoo)
+cbsetraw <- read.csv("Cbcompanies.csv")
+```
+
+Address some formatting issues
+
+```{r}
+cbset <- cbsetraw
+#convert valuation numbers to numeric format by stripping the $s and ,s
+cbset$Total.Funding.Amount <- as.numeric(gsub("[[:punct:]]", "", cbset$Total.Funding.Amount))
+cbset$Valuation.at.IPO <- as.numeric(gsub("[[:punct:]]", "", cbset$Valuation.at.IPO))
+#then convert acquired_at to proper date format
+cbset$Founded.Date <- as.Date(cbset$Founded.Date, format = "%m/%d/%Y")
+cbset$Closed.Date <- as.Date(cbset$Closed.Date, format = "%m/%d/%Y")
+cbset$IPO.Date <- as.Date(cbset$IPO.Date, format = "%m/%d/%Y")
+#strip away repeats, some of which were created when pulling in the data
+cbset <- unique(cbset)
+#one correction here.  Beepi was actually closed and not acquired.
+cbset$Status[which(cbset$Company.Name == "Beepi")] <- "Closed"
+#ROOST is a problem that needs to be addressed here eventually
+cbset$X <- NULL
+nrow(cbset)
+```
+
+*OPTIONAL* Create new columns for city & state info
+
+```{r}
+#extract the city name from Headquarters.Location column
+#cbset$city <- sapply(strsplit(as.character(cbset$Headquarters.Location),','), "[", 1)
+#cbset$state <- sapply(strsplit(as.character(cbset$Headquarters.Location),','), "[", 2)
+#cbset$nameyear <- paste(cbset$Company.Name, cbset$Founded.Date)
+```
+
+Pull in the acquisitions data.  These are companies which recieved Angel or Seed funding at some point, and were aquired between 01/01/2007 and 09/26/2017.  There are 2049 rows.
+
+```{r}
+acq = read.csv("fullacquisitions2.csv")
+#same formatting issues here
+acq$Price <- as.numeric(gsub("[[:punct:]]", "", acq$Price))
+acq$Announced.Date <- as.Date(gsub(",", "", acq$Announced.Date), format = "%d-%b-%y")
+acq$X <- NULL
+colnames(acq)[3] <- "Company.Name"
+colnames(acq)[4] <- "Company.Name.URL"
+colnames(acq)[7] <- "Acquisition.Date"
+nrow(acq)
+```
+
+Pull in the rounds data. These are all our companies that raised "seed" or "angel" capital in the amount of $100k or more
+in 2007 or later, were US based, and had a Crunchbase rating (this last requirement eliminated 10,000 companies).  
+
+```{r}
+rounds <- read.csv("cbrounds.csv")
+rounds$X <- NULL
+rounds <- unique(rounds)
+nrow(rounds)
+```
+
+We need to combine these three datasets as each contains information we'll need for our analysis. Our Rounds dataset includes information for each round of funding for each company.  This means that a company could have multiple rows in the table (multiple seed rounds). While we may come back to this set and see how funding evolved, or compare B-rounds among companies for example, FOR NOW what we need from this table is to know when each company recieved it's first outside funding, and its last. We have to be careful here as there are unique companies that share a name (three different Roosts for example).  
+
+```{r}
+#create a list that includes for each company the date of its first & last funding rounds
+firstFunding <- rounds %>% group_by(Company.Name) %>% summarise(First.Funding = min(as.Date(Announced.On.Date, "%m/%d/%Y")))
+lastFunding <- rounds %>% group_by(Company.Name) %>% summarise(Last.Funding = max(as.Date(Announced.On.Date, "%m/%d/%Y")))
+#merge them into a single table. This will be the starting point for our joined table
+allFunding <- merge(x = firstFunding, y = lastFunding, by = "Company.Name")
+#then we tidy up our cbset before merging it
+cbset$Company.Name.URL <- NULL
+cbset$Description <- NULL
+cbset$Website <- NULL
+#starting with our allFunding list, we add the columns from our cbset 
+cbset2 <- merge(x = allFunding, y = cbset, by = "Company.Name", all.x = TRUE)
+#we're going to take Quaero out here, it was initially acquired in 2008 and purchased itself back (undisclosed pre-seed) in 2014
+```
+
+Then we add selected columns from our Acq dataset.  We notice here that there are a number of companies that appear multiple times, meaning multiple acquisitions.  We want to keep just the earliest one, the first liquidity event.  
+
+```{r}
+#first, subset for just the columns we need
+acq2 <- subset(acq, select = c("Company.Name", "Acquiring.Organization.Name", "Acquisition.Date", "Price"))
+#see some of the companies that are duplicated
+summary(acq2$Company.Name)[1:10]
+firstAcq <- acq2 %>% group_by(Company.Name) %>% summarise(First.Acquired = min(Acquisition.Date))
+acq3 <- merge(x = acq2, y = firstAcq, by = "Company.Name", all.x = TRUE)
+#remove the rows containing information on "second acquisitions"
+duplicates <- which(acq3$Acquisition.Date != acq3$First.Acquired)
+acq4 <- acq3[-c(duplicates),]
+#remove the duplicate row
+acq4$First.Acquired <- NULL
+#merge this info into our main cbset dataset
+cbset3 <- merge(x = cbset2, y = acq4, by = "Company.Name", all.x = TRUE)
+#our Number.Of.Investors row has lost its meaning, so we take it out.
+cbset3$Number.of.Investors <- NULL
+```
+
+#Building up date information
+
+It will be extremely helpful to our analysis to define the Age of each of these companies.  The Age clock begins with First.Funding, which by design is fully populated (no NAs). Now we need an End.Date for each.  We'll start with our Closed Companies.  There are 66 of them. Of these, 23 have a listed Closed.Date which we just copy over. For the others, we'll assume that operations ceased one year after their final round of funding.  
+
+```{r}
+cbset3$End.Date = NA
+closeds <- subset(cbset3, Status == "Closed")
+#some of the companies have listed closed dates
+closeds$End.Date[which(!is.na(closeds$Closed.Date))] <- closeds$Closed.Date[which(!is.na(closeds$Closed.Date))]
+#for others, we create a vector whose distribution resembles that of the populated companies, and is similarly truncated
+test <- closeds[which(!is.na(closeds$Closed.Date)),]
+test$Last.Funding.Lasted <- as.numeric(test$Closed.Date - test$Last.Funding)
+library(truncnorm)
+closedsamp <- rtruncnorm(n=sum(is.na(closeds$Closed.Date)), a=300, b=summary(test$Last.Funding.Lasted)[5], mean=mean(test$Last.Funding.Lasted), sd=sd(test$Last.Funding.Lasted))
+#these are the number of days each company is presumed to have lasted after its last funding.  These are added to 
+#the Last.Funding date to get our End.Dates
+closeds$End.Date[which(is.na(closeds$Closed.Date))] <- closeds$Last.Funding[which(is.na(closeds$Closed.Date))] + closedsamp
+#so End.Date has been populated but they're all in integers, use zoo package to rewrite them as dates for readability
+closeds$End.Date <- as.Date(closeds$End.Date)
+```
+
+And for the Operating Companies, the End.Date will be the date the data was pulled, Sept 26, 2017
+
+```{r}
+operators <- subset(cbset3, Status == "Operating")
+operators$End.Date <- as.Date("2017/09/26", format = "%Y/%m/%d")
+```
+
+There are 16 companies that IPOed; they all have dates listed.  These we copy directly over. 
+
+```{r}
+ipos <- subset(cbset3, Status == "IPO")
+nrow(ipos)
+#lets make sure there are no missing IPO Dates
+length(which(!is.na(ipos$IPO.Date)))
+#copy over the date of the IPO
+ipos$End.Date[which(!is.na(ipos$IPO.Date))] <- ipos$IPO.Date[which(!is.na(ipos$IPO.Date))]
+ipos$End.Date <- as.Date(ipos$End.Date)
+```
+
+And then for our Acquireds.  There are 820 companies on this list, one of which is missing an IPO date, which we populate here.
+
+```{r}
+acqds <- subset(cbset3, Status == "Was Acquired")
+nrow(acqds)
+#and make one adjustment to the information.  Vest details were not included in the acquisition information. 
+acqds$Acquisition.Date[which(acqds$Company.Name == "Vest")] <- as.Date("2016/01/25", format = "%Y/%m/%d")
+#some of the companies have listed acquisition dates
+acqds$End.Date[which(!is.na(acqds$Acquisition.Date))] <- acqds$Acquisition.Date[which(!is.na(acqds$Acquisition.Date))]
+acqds$End.Date <- as.Date(acqds$End.Date)
+```
+And a quick check that all our End.Date information has been populated. 
+
+```{r}
+summary(closeds$End.Date)
+summary(operators$End.Date)
+summary(ipos$End.Date)
+summary(acqds$End.Date)
+```
+
+Hooray! It worked.  And then we reassemble our list; note that this now EXCLUDES 74 companies with Status listed as NA.  We can always come back and remedy this, but in the interest of time will move forward with the 6825 rows we have.
+
+```{r}
+cbset4 <- rbind(closeds, operators, ipos, acqds)
+cbset4$Age <- NA
+cbset4$Age <- as.integer(cbset4$End.Date - cbset4$First.Funding)
+```
+
+The new Age column reveals some additional flaws in the data.  There are a number of companies that show negative ages (some have come back to the market one or more times, in different incarnations).  In the interest of time, we're going to eliminate companies that are <90 days of age and not listed as Operating.  This eliminates 25 companies.
+
+```{r}
+scratch <- which(cbset4$Status != "Operating" & cbset4$Age < 90)
+cbset5 <- cbset4[-c(scratch),]
+```
+
+We're going to export this dataset and proceed with the analysis in a new report.
+
+```{r}
+write.csv(cbset5, "cleancb.csv")
+```
+
+
+
