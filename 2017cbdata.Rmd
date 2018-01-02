@@ -238,7 +238,7 @@ THIS NEEDS A LOT OF WORK
 ```{r}
 #we arbitrarily shift the regression line on our unpopulated set unitwise by a factor of .85 to 
 #acknowledge that the returns here are lower categorically than for our priced/acquired group
-data3$Inferred.Return <- ((datamod5$coefficients[1]) + datamod5$coefficients[2]*data3.remainder$Age)^6
+data3$Inferred.Return <- ((datamod5$coefficients[1]) + datamod5$coefficients[2]*data3$Age)^6
 summary(data3$Inferred.Return)
 summary(data2$Inferred.Return)
 data3$Inferred.Price <- (data3$Total.Funding.Amount * (1 + data3$Inferred.Return) ^ (as.integer(data3$Age)/365.25))
